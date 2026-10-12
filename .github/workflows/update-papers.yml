@@ -22,6 +22,9 @@ jobs:
           python-version: '3.x'
 
       - name: Fetch latest arXiv papers
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MAX_NEW_BRIEFS: "3"
         run: python scripts/fetch_arxiv.py
 
       - name: Commit updated data when changed
