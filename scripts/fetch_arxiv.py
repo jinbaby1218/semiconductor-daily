@@ -1,15 +1,24 @@
 
+import email.utils
 import json
+import random
 import re
+import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = ROOT / "papers.json"
 API = "https://export.arxiv.org/api/query"
+
+# 最多请求 5 次，包括首次请求。
+MAX_ATTEMPTS = 5
+REQUEST_TIMEOUT = 45
 
 NS = {
     "atom": "http://www.w3.org/2005/Atom",
@@ -17,11 +26,11 @@ NS = {
 }
 
 CATEGORIES = {
-    "lithography": "\u0044\u0055\u0056 \u5149\u523b",
-    "metrology": "\u91cf\u68c0\u6d4b\u8bbe\u5907",
-    "packaging": "\u5148\u8fdb\u5c01\u88c5",
-    "manufacturing": "\u534a\u5bfc\u4f53\u5236\u9020",
-    "materials": "\u6750\u6599\u4e0e\u5de5\u827a",
+    "lithography": "DUV 光刻",
+    "metrology": "量检测设备",
+    "packaging": "先进封装",
+    "manufacturing": "半导体制造",
+    "materials": "材料与工艺",
 }
 
 
@@ -61,6 +70,72 @@ def classify(title, summary):
     return CATEGORIES["materials"]
 
 
+def retry_delay(exc, attempt):
+    """优先遵循 Retry-After，否则采用指数退避。"""
+    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+
+    if retry_after:
+        try:
+            # Retry-After: 120
+            delay = float(retry_after)
+        except (TypeError, ValueError):
+            try:
+                # Retry-After: Wed, 21 Oct 2026 07:28:00 GMT
+                retry_time = email.utils.parsedate_to_datetime(retry_after)
+                if retry_time.tzinfo is None:
+                    retry_time = retry_time.replace(tzinfo=timezone.utc)
+                delay = (
+                    retry_time - datetime.now(timezone.utc)
+                ).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                delay = 30 * (2 ** attempt)
+    else:
+        delay = 30 * (2 ** attempt)
+
+    # 不短于服务器要求的等待时间；避免因随机抖动而提前重试。
+    return max(1.0, delay) + random.uniform(0, 3)
+
+
+def open_with_retry(request, attempts=MAX_ATTEMPTS,
+                    timeout=REQUEST_TIMEOUT):
+    """有限重试，避免连续请求加重 arXiv 服务端压力。"""
+    for attempt in range(attempts):
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+
+        except urllib.error.HTTPError as exc:
+            retryable = exc.code == 429 or 500 <= exc.code < 600
+
+            if not retryable or attempt == attempts - 1:
+                raise
+
+            delay = retry_delay(exc, attempt)
+            print(
+                f"arXiv 返回 HTTP {exc.code}；"
+                f"{delay:.1f} 秒后重试 "
+                f"({attempt + 1}/{attempts - 1})",
+                flush=True,
+            )
+            exc.close()
+            time.sleep(delay)
+
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt == attempts - 1:
+                raise
+
+            delay = min(30 * (2 ** attempt), 300)
+            delay += random.uniform(0, 3)
+            print(
+                f"arXiv 网络请求失败：{exc}；"
+                f"{delay:.1f} 秒后重试 "
+                f"({attempt + 1}/{attempts - 1})",
+                flush=True,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError("arXiv 请求重试失败")
+
+
 def fetch():
     query = (
         'all:photolithography OR all:semiconductor OR '
@@ -78,10 +153,16 @@ def fetch():
 
     request = urllib.request.Request(
         API + "?" + params,
-        headers={"User-Agent": "SemiconductorDaily/1.0"},
+        headers={
+            "User-Agent": (
+                "SemiconductorDaily/1.0 "
+                "(automated academic paper index)"
+            ),
+            "Accept": "application/atom+xml",
+        },
     )
 
-    with urllib.request.urlopen(request, timeout=45) as response:
+    with open_with_retry(request) as response:
         xml_data = response.read()
 
     root = ET.fromstring(xml_data)
@@ -96,21 +177,28 @@ def fetch():
             continue
 
         match = re.search(r"(\d{4}\.\d{4,5})", paper_url)
-        arxiv_id = match.group(1) if match else paper_url.rsplit("/", 1)[-1]
+        arxiv_id = (
+            match.group(1)
+            if match
+            else paper_url.rsplit("/", 1)[-1]
+        )
 
         published = text_of(entry, "atom:published")[:10]
+
         authors = [
             text_of(author, "atom:name")
             for author in entry.findall("atom:author", NS)
         ]
 
         pdf_url = "https://arxiv.org/pdf/" + arxiv_id
+
         for link in entry.findall("atom:link", NS):
             if link.attrib.get("title") == "pdf":
                 pdf_url = link.attrib.get("href", pdf_url)
                 break
 
         category = classify(title, abstract)
+        combined_text = (title + " " + abstract).lower()
         keywords = [category]
 
         for word in (
@@ -118,7 +206,7 @@ def fetch():
             "semiconductor", "wafer", "photoresist",
             "defect", "yield", "process control"
         ):
-            if word.lower() in (title + " " + abstract).lower():
+            if word.lower() in combined_text:
                 keywords.append(word)
 
         articles.append({
@@ -131,7 +219,10 @@ def fetch():
             "read": max(2, min(12, len(abstract) // 900 + 2)),
             "keywords": list(dict.fromkeys(keywords))[:5],
             "summary": abstract,
-            "detail": "Authors: " + ", ".join(authors) + "\n\n" + abstract,
+            "detail": (
+                "Authors: " + ", ".join(authors)
+                + "\n\n" + abstract
+            ),
             "url": paper_url,
             "pdfUrl": pdf_url,
             "authors": authors,
@@ -139,21 +230,58 @@ def fetch():
         })
 
     if not articles:
-        raise RuntimeError("arXiv returned no usable articles")
+        raise RuntimeError(
+            "arXiv returned no usable articles; "
+            "existing papers.json was preserved"
+        )
 
     payload = {
-        "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "updatedAt": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+        ),
         "source": "arXiv API",
         "count": len(articles),
         "articles": articles,
     }
 
-    OUTPUT.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    # 先写入同目录临时文件，写入成功后再原子替换。
+    # 即使写入中断，也不会直接截断原有 papers.json。
+    temp_path = None
 
-    print("Saved", len(articles), "articles to", OUTPUT)
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=ROOT,
+            prefix=".papers-",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            json.dump(
+                payload,
+                temp_file,
+                ensure_ascii=False,
+                indent=2,
+            )
+            temp_file.write("\n")
+            temp_file.flush()
+
+        temp_path.replace(OUTPUT)
+        temp_path = None
+
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    print(
+        f"Saved {len(articles)} articles to {OUTPUT}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
