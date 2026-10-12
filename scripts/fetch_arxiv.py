@@ -11,6 +11,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
+from summarize_papers import add_chinese_briefs
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = ROOT / "papers.json"
@@ -235,6 +236,9 @@ def fetch():
             "existing papers.json was preserved"
         )
 
+    # 生成或复用中文速读
+    articles = add_chinese_briefs(articles)
+    
     payload = {
         "updatedAt": time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
