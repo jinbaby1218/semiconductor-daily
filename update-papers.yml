@@ -1,0 +1,38 @@
+name: Update arXiv papers
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily at 00:37 UTC (08:37 in China; 09:37 in Japan).
+    - cron: '37 0 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  update-papers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Fetch latest arXiv papers
+        run: python scripts/fetch_arxiv.py
+
+      - name: Commit updated data when changed
+        run: |
+          if git status --porcelain -- papers.json | grep -q .; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add papers.json
+            git commit -m "Update arXiv papers"
+            git push
+          else
+            echo "papers.json is unchanged; no commit needed."
+          fi
