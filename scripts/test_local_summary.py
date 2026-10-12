@@ -11,7 +11,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "papers.json"
 
-MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 OUTPUT = Path(os.environ.get(
     "GITHUB_STEP_SUMMARY",
     "/tmp/silicon-brief-summary.md"
